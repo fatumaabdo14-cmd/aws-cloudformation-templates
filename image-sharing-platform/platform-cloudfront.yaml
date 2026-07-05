@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Image Sharing Platform - CloudFront CDN for S3 images
+
+Parameters:
+  ImageBucketName:
+    Type: String
+    Description: Existing S3 bucket name
+
+  ImageBucketDomainName:
+    Type: String
+    Description: S3 regional domain name
+
+Resources:
+  ImageOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub image-platform-s3-oac-${AWS::StackName}
+        Description: OAC for image platform S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ImageDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Image sharing platform CDN
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: ImageS3Origin
+            DomainName: !Ref ImageBucketDomainName
+            OriginAccessControlId: !Ref ImageOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: ImageS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  ImageBucketPolicyForCloudFront:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadImages
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${ImageBucketName}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${ImageDistribution}
+
+Outputs:
+  CloudFrontDomainName:
+    Description: CloudFront domain name for images
+    Value: !GetAtt ImageDistribution.DomainName
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref ImageDistribution

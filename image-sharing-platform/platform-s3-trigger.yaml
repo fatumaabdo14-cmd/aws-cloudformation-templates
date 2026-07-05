@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Image Sharing Platform - connect existing S3 bucket to image processor Lambda
+
+Parameters:
+  ImageBucketName:
+    Type: String
+    Description: Existing S3 bucket name for image uploads
+
+Resources:
+  ProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::ImportValue: image-platform-ImageProcessorFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${ImageBucketName}
+
+  S3NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: image-platform-s3-notification-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: image-platform-s3-notification-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource: !Sub arn:aws:s3:::${ImageBucketName}
+
+  S3NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: image-platform-s3-notification-custom-resource
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt S3NotificationRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import traceback
+          import urllib.request
+          import boto3
+
+          s3 = boto3.client("s3")
+
+          def send(event, context, status, data, reason=None):
+              response_body = {
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Logs: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data
+              }
+
+              body = json.dumps(response_body).encode("utf-8")
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={
+                      "content-type": "",
+                      "content-length": str(len(body))
+                  }
+              )
+              urllib.request.urlopen(request)
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  bucket = props["BucketName"]
+                  function_arn = props["FunctionArn"]
+                  prefix = props.get("Prefix", "uploads/")
+
+                  current = s3.get_bucket_notification_configuration(Bucket=bucket)
+
+                  new_config = {}
+                  for key in ["TopicConfigurations", "QueueConfigurations", "EventBridgeConfiguration"]:
+                      if key in current:
+                          new_config[key] = current[key]
+
+                  lambda_configs = [
+                      item for item in current.get("LambdaFunctionConfigurations", [])
+                      if item.get("Id") != "ImageProcessorTrigger"
+                  ]
+
+                  if event["RequestType"] != "Delete":
+                      lambda_configs.append({
+                          "Id": "ImageProcessorTrigger",
+                          "LambdaFunctionArn": function_arn,
+                          "Events": ["s3:ObjectCreated:*"],
+                          "Filter": {
+                              "Key": {
+                                  "FilterRules": [
+                                      {"Name": "prefix", "Value": prefix}
+                                  ]
+                              }
+                          }
+                      })
+
+                  if lambda_configs:
+                      new_config["LambdaFunctionConfigurations"] = lambda_configs
+
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration=new_config
+                  )
+
+                  send(event, context, "SUCCESS", {"BucketName": bucket})
+              except Exception as error:
+                  print(traceback.format_exc())
+                  send(event, context, "FAILED", {}, str(error))
+
+  S3ImageUploadTrigger:
+    Type: Custom::S3LambdaNotification
+    DependsOn:
+      - ProcessorInvokePermission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName: !Ref ImageBucketName
+      FunctionArn:
+        Fn::ImportValue: image-platform-ImageProcessorFunctionArn
+      Prefix: uploads/
+
+Outputs:
+  TriggerStatus:
+    Description: S3 trigger status
+    Value: S3 uploads now invoke the image processor Lambda

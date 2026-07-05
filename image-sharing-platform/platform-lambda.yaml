@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Image Sharing Platform - Lambda functions
+
+Parameters:
+  ImageBucketName:
+    Type: String
+    Description: Existing S3 bucket name for images
+
+  DynamoDBTableName:
+    Type: String
+    Default: ImageMetadata
+    Description: Existing DynamoDB table name
+
+Resources:
+  ImageLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: image-platform-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: image-platform-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:aws:s3:::${ImageBucketName}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${ImageBucketName}
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTableName}
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTableName}/index/*
+
+  UploadUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: image-platform-generate-upload-url
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ImageLambdaRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ImageBucketName
+          TABLE_NAME: !Ref DynamoDBTableName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import uuid
+          import boto3
+
+          s3 = boto3.client("s3")
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+          bucket = os.environ["BUCKET_NAME"]
+
+          def response(status_code, body):
+              return {
+                  "statusCode": status_code,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "Content-Type,Authorization",
+                      "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                  },
+                  "body": json.dumps(body)
+              }
+
+          def get_user_id(event, body):
+              claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
+              return claims.get("sub") or body.get("userId") or "demo-user"
+
+          def handler(event, context):
+              body = json.loads(event.get("body") or "{}")
+              content_type = body.get("contentType", "image/jpeg")
+
+              if not content_type.startswith("image/"):
+                  return response(400, {"message": "Only image uploads are allowed"})
+
+              user_id = get_user_id(event, body)
+              image_id = str(uuid.uuid4())
+              extension = content_type.split("/")[-1].replace("jpeg", "jpg")
+              key = f"uploads/{user_id}/{image_id}.{extension}"
+              now = int(time.time())
+
+              upload_url = s3.generate_presigned_url(
+                  "put_object",
+                  Params={
+                      "Bucket": bucket,
+                      "Key": key,
+                      "ContentType": content_type
+                  },
+                  ExpiresIn=3600
+              )
+
+              table.put_item(
+                  Item={
+                      "imageId": image_id,
+                      "userId": user_id,
+                      "s3Key": key,
+                      "status": "UPLOAD_URL_CREATED",
+                      "visibility": body.get("visibility", "private"),
+                      "likes": 0,
+                      "comments": [],
+                      "createdAt": now,
+                      "updatedAt": now
+                  }
+              )
+
+              return response(200, {
+                  "imageId": image_id,
+                  "uploadUrl": upload_url,
+                  "s3Key": key
+              })
+
+  ImageProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: image-platform-process-image
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ImageLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ImageBucketName
+          TABLE_NAME: !Ref DynamoDBTableName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import urllib.parse
+          import boto3
+
+          s3 = boto3.client("s3")
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+
+          def handler(event, context):
+              print(json.dumps(event))
+
+              for record in event.get("Records", []):
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+                  if not key.startswith("uploads/"):
+                      continue
+
+                  parts = key.split("/")
+                  if len(parts) < 3:
+                      continue
+
+                  user_id = parts[1]
+                  filename = parts[-1]
+                  image_id = os.path.splitext(filename)[0]
+                  processed_key = f"processed/{user_id}/{filename}"
+                  now = int(time.time())
+
+                  # Starter processing: copies uploaded image to processed/.
+                  # Later replace this with real thumbnail code using Pillow or Sharp.
+                  s3.copy_object(
+                      Bucket=bucket,
+                      CopySource={"Bucket": bucket, "Key": key},
+                      Key=processed_key
+                  )
+
+                  table.update_item(
+                      Key={"imageId": image_id},
+                      UpdateExpression="SET #status = :status, originalKey = :originalKey, processedKey = :processedKey, updatedAt = :updatedAt",
+                      ExpressionAttributeNames={"#status": "status"},
+                      ExpressionAttributeValues={
+                          ":status": "PROCESSED",
+                          ":originalKey": key,
+                          ":processedKey": processed_key,
+                          ":updatedAt": now
+                      }
+                  )
+
+              return {"statusCode": 200, "body": "Image processing completed"}
+
+Outputs:
+  UploadUrlFunctionName:
+    Value: !Ref UploadUrlFunction
+    Export:
+      Name: image-platform-UploadUrlFunctionName
+
+  UploadUrlFunctionArn:
+    Value: !GetAtt UploadUrlFunction.Arn
+    Export:
+      Name: image-platform-UploadUrlFunctionArn
+
+  ImageProcessorFunctionName:
+    Value: !Ref ImageProcessorFunction
+    Export:
+      Name: image-platform-ImageProcessorFunctionName
+
+  ImageProcessorFunctionArn:
+    Value: !GetAtt ImageProcessorFunction.Arn
+    Export:
+      Name: image-platform-ImageProcessorFunctionArn

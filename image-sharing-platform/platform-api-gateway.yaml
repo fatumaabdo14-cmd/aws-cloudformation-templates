@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Image Sharing Platform - API Gateway
+
+Resources:
+  ImageApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: image-platform-api
+      Description: API for image sharing platform
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: image-platform-cognito-authorizer
+      RestApiId: !Ref ImageApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - Fn::ImportValue: image-platform-UserPoolArn
+
+  UploadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageApi
+      ParentId: !GetAtt ImageApi.RootResourceId
+      PathPart: upload-url
+
+  UploadUrlPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn:
+              Fn::ImportValue: image-platform-UploadUrlFunctionArn
+
+  UploadUrlOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UploadUrlLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::ImportValue: image-platform-UploadUrlFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ImageApi}/*/*/*
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadUrlPostMethod
+      - UploadUrlOptionsMethod
+    Properties:
+      RestApiId: !Ref ImageApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ImageApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway invoke URL
+    Value: !Sub https://${ImageApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: image-platform-ApiUrl
+
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref ImageApi
+    Export:
+      Name: image-platform-ApiId

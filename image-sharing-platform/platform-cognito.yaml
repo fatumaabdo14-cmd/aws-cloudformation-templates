@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Image Sharing Platform - Cognito authentication
+
+Resources:
+  ImageUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: image-platform-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  ImageUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: image-platform-web-mobile-client
+      UserPoolId: !Ref ImageUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref ImageUserPool
+    Export:
+      Name: image-platform-UserPoolId
+
+  UserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt ImageUserPool.Arn
+    Export:
+      Name: image-platform-UserPoolArn
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref ImageUserPoolClient
+    Export:
+      Name: image-platform-UserPoolClientId
